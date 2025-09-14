@@ -99,6 +99,10 @@ echo -e "[code]\nname=Visual Studio Code\nbaseurl=https://packages.microsoft.com
 dnf check-update
 sudo dnf install code -y
 
+wget "https://repo.protonvpn.com/fedora-$(cat /etc/fedora-release | cut -d' ' -f 3)-stable/protonvpn-stable-release/protonvpn-stable-release-1.0.3-1.noarch.rpm"
+sudo dnf install -y ./protonvpn-stable-release-1.0.3-1.noarch.rpm && sudo dnf check-update --refresh 
+sudo dnf install -y proton-vpn-gnome-desktop 
+
 
 sudo dnf install -y thunderbird keepassxc syncthing okular gimp texstudio texlive-scheme-full htop meld vlc ImageMagick chromium terminator tlp tlp-rdw inkscape wireguard-tools lm_sensors remmina ansible gnome-tweaks fish lshw dmidecode gparted
 
