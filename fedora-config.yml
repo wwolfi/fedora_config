@@ -1,0 +1,541 @@
+---
+- name: Fedora System Configuration and Software Installation
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    user_name: "{{ ansible_user_id }}"
+    home_dir: "{{ ansible_env.HOME }}"
+    prog_dir: "{{ home_dir }}/Documents/prog"
+    
+  tasks:
+    # ============================================================================
+    # MANUAL FACT GATHERING (only when needed)
+    # ============================================================================
+    
+    - name: Gather minimal facts
+      setup:
+        gather_subset:
+          - '!all'
+          - '!any'
+          - 'user_id'
+          - 'env'
+      tags: always
+      when: ansible_user_id is not defined
+    
+    # Set facts manually if not gathered
+    - name: Set user facts manually
+      set_fact:
+        user_name: "{{ ansible_user_id | default(ansible_env.USER) }}"
+        home_dir: "{{ ansible_env.HOME | default('/home/' + ansible_env.USER) }}"
+      tags: always
+      
+    - name: Set derived facts
+      set_fact:
+        prog_dir: "{{ home_dir }}/Documents/prog"
+      tags: always
+    # ============================================================================
+    # SYSTEM PREPARATION AND UPDATES
+    # ============================================================================
+    
+    - name: Display system information
+      debug:
+        msg: "Configuring Fedora system for user: {{ user_name }}"
+
+    - name: Disable GRUB menu auto-hide
+      shell: grub2-editenv - unset menu_auto_hide
+      register: grub_result
+      changed_when: grub_result.rc == 0
+
+    - name: Update all packages
+      dnf:
+        name: "*"
+        state: latest
+        update_cache: yes
+      register: update_result
+
+    - name: Display update results
+      debug:
+        msg: "System update completed. {{ update_result.results | length }} packages processed"
+
+    # ============================================================================
+    # SNAPPER AND BTRFS SNAPSHOT CONFIGURATION
+    # ============================================================================
+
+    - name: Install Snapper and BTRFS tools
+      dnf:
+        name:
+          - snapper
+          - libdnf5-plugin-actions
+          - btrfs-assistant
+          - inotify-tools
+          - git
+          - make
+        state: present
+      tags: snapper
+
+    - name: Create snapper actions configuration directory
+      file:
+        path: /etc/dnf/libdnf5-plugins/actions.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure DNF Snapper integration
+      copy:
+        dest: /etc/dnf/libdnf5-plugins/actions.d/snapper.actions
+        content: |
+          # Get snapshot description
+          pre_transaction::::/usr/bin/sh -c echo\ "tmp.cmd=$(ps\ -o\ command\ --no-headers\ -p\ '${pid}')"
+
+          # Creates pre snapshot before the transaction and stores the snapshot number in the "tmp.snapper_pre_number"  variable.
+          pre_transaction::::/usr/bin/sh -c echo\ "tmp.snapper_pre_number=$(snapper\ create\ -t\ pre\ -c\ number\ -p\ -d\ '${tmp.cmd}')"
+
+          # If the variable "tmp.snapper_pre_number" exists, it creates post snapshot after the transaction and removes the variable "tmp.snapper_pre_number".
+          post_transaction::::/usr/bin/sh -c [\ -n\ "${tmp.snapper_pre_number}"\ ]\ &&\ snapper\ create\ -t\ post\ --pre-number\ "${tmp.snapper_pre_number}"\ -c\ number\ -d\ "${tmp.cmd}"\ ;\ echo\ tmp.snapper_pre_number\ ;\ echo\ tmp.cmd
+        mode: '0644'
+
+    - name: Check if Snapper config for root exists
+      shell: snapper -c root list-configs
+      register: snapper_root_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create Snapper config for root
+      shell: snapper -c root create-config /
+      register: snapper_root_result
+      changed_when: snapper_root_result.rc == 0
+      failed_when: false
+      when: snapper_root_check.rc != 0
+
+    - name: Display root config status
+      debug:
+        msg: "{{ 'Snapper root config created' if snapper_root_result.changed | default(false) else 'Snapper root config already exists' }}"
+
+    - name: Check if Snapper config for home exists
+      shell: snapper -c home list-configs
+      register: snapper_home_check
+      failed_when: false
+      changed_when: false
+
+    - name: Create Snapper config for home
+      shell: snapper -c home create-config /home
+      register: snapper_home_result
+      changed_when: snapper_home_result.rc == 0
+      failed_when: false
+      when: snapper_home_check.rc != 0
+
+    - name: Display home config status
+      debug:
+        msg: "{{ 'Snapper home config created' if snapper_home_result.changed | default(false) else 'Snapper home config already exists' }}"
+
+    - name: Restore SELinux contexts for snapshots
+      shell: |
+        restorecon -RFv /.snapshots
+        restorecon -RFv /home/.snapshots
+      register: selinux_result
+      changed_when: selinux_result.rc == 0
+
+    - name: Configure Snapper permissions for root
+      shell: snapper -c root set-config ALLOW_USERS={{ user_name }} SYNC_ACL=yes
+      register: snapper_root_config
+      changed_when: snapper_root_config.rc == 0
+
+    - name: Configure Snapper permissions for home
+      shell: snapper -c home set-config ALLOW_USERS={{ user_name }} SYNC_ACL=yes
+      register: snapper_home_config
+      changed_when: snapper_home_config.rc == 0
+
+    - name: Configure updatedb to ignore snapshots
+      lineinfile:
+        path: /etc/updatedb.conf
+        line: 'PRUNENAMES = ".snapshots"'
+        create: yes
+
+    # ============================================================================
+    # GRUB-BTRFS INSTALLATION AND CONFIGURATION
+    # ============================================================================
+
+    - name: Create programming directory
+      file:
+        path: "{{ prog_dir }}"
+        state: directory
+        owner: "{{ user_name }}"
+        group: "{{ user_name }}"
+        mode: '0755'
+      become_user: "{{ user_name }}"
+
+    - name: Clone grub-btrfs repository
+      git:
+        repo: https://github.com/Antynea/grub-btrfs
+        dest: "{{ prog_dir }}/grub-btrfs"
+        force: yes
+      become_user: "{{ user_name }}"
+
+    - name: Configure grub-btrfs settings
+      replace:
+        path: "{{ prog_dir }}/grub-btrfs/config"
+        regexp: "{{ item.regexp }}"
+        replace: "{{ item.replace }}"
+        backup: yes
+      loop:
+        - { regexp: '^#GRUB_BTRFS_SNAPSHOT_KERNEL_PARAMETERS=.*', replace: '#GRUB_BTRFS_SNAPSHOT_KERNEL_PARAMETERS=\nGRUB_BTRFS_SNAPSHOT_KERNEL_PARAMETERS="rd.live.overlay.overlayfs=1"' }
+        - { regexp: '^#GRUB_BTRFS_GRUB_DIRNAME=.*', replace: '#GRUB_BTRFS_GRUB_DIRNAME=\nGRUB_BTRFS_GRUB_DIRNAME="/boot/grub2"' }
+        - { regexp: '^#GRUB_BTRFS_MKCONFIG=.*', replace: '#GRUB_BTRFS_MKCONFIG=\nGRUB_BTRFS_MKCONFIG=/usr/bin/grub2-mkconfig' }
+        - { regexp: '^#GRUB_BTRFS_SCRIPT_CHECK=.*', replace: '#GRUB_BTRFS_SCRIPT_CHECK=\nGRUB_BTRFS_SCRIPT_CHECK=grub2-script-check' }
+
+    - name: Install grub-btrfs
+      make:
+        chdir: "{{ prog_dir }}/grub-btrfs"
+        target: install
+
+    - name: Enable and start grub-btrfsd service
+      systemd:
+        name: grub-btrfsd.service
+        enabled: yes
+        state: started
+
+    # ============================================================================
+    # LUKS ENCRYPTION KEY SETUP
+    # ============================================================================
+
+    - name: Get LUKS UUID
+      shell: grub2-probe --target=cryptodisk_uuid /
+      register: luks_uuid_result
+      changed_when: false
+
+    - name: Set LUKS UUID variable
+      set_fact:
+        luks_uuid: "{{ luks_uuid_result.stdout }}"
+
+    - name: Display LUKS UUID
+      debug:
+        msg: "LUKS UUID: {{ luks_uuid }}"
+
+    - name: Create cryptsetup keys directory
+      file:
+        path: /etc/cryptsetup-keys.d
+        state: directory
+        mode: '0700'
+
+    - name: Generate LUKS key file
+      shell: dd if=/dev/random of=/etc/cryptsetup-keys.d/luks-{{ luks_uuid }}.key bs=512 count=8
+      register: key_generation
+      changed_when: key_generation.rc == 0
+      args:
+        creates: "/etc/cryptsetup-keys.d/luks-{{ luks_uuid }}.key"
+
+    - name: Set permissions on LUKS key file
+      file:
+        path: "/etc/cryptsetup-keys.d/luks-{{ luks_uuid }}.key"
+        mode: '0400'
+
+    - name: Add LUKS key to device
+      expect:
+        command: cryptsetup luksAddKey --pbkdf pbkdf2 --pbkdf-force-iterations 500000 /dev/disk/by-uuid/{{ luks_uuid }} /etc/cryptsetup-keys.d/luks-{{ luks_uuid }}.key
+        responses:
+          'Enter any existing passphrase:': "{{ luks_passphrase | default('') }}"
+      when: luks_passphrase is defined
+      no_log: true
+
+    - name: Configure dracut for LUKS key
+      copy:
+        dest: /etc/dracut.conf.d/cryptodisk.conf
+        content: 'install_items+=" /etc/cryptsetup-keys.d/luks-{{ luks_uuid }}.key "'
+        mode: '0644'
+
+    - name: Rebuild initramfs
+      shell: dracut -vf
+      register: dracut_result
+      changed_when: dracut_result.rc == 0
+
+    # ============================================================================
+    # THIRD-PARTY REPOSITORIES AND SOFTWARE
+    # ============================================================================
+
+    - name: Download eduVPN GPG key
+      get_url:
+        url: https://app.eduvpn.org/linux/v4/rpm/app+linux@eduvpn.org.asc
+        dest: /tmp/eduvpn.asc
+        mode: '0644'
+
+    - name: Import eduVPN GPG key
+      rpm_key:
+        key: /tmp/eduvpn.asc
+        state: present
+
+    - name: Add eduVPN repository
+      yum_repository:
+        name: python-eduvpn-client_v4
+        description: "eduVPN for Linux 4.x (Fedora $releasever)"
+        baseurl: "https://app.eduvpn.org/linux/v4/rpm/fedora-$releasever-$basearch"
+        gpgcheck: yes
+        enabled: yes
+
+    - name: Install eduVPN client
+      dnf:
+        name: eduvpn-client
+        state: present
+
+    - name: Add SoftMaker repository
+      get_url:
+        url: https://shop.softmaker.com/repo/softmaker.repo
+        dest: /etc/yum.repos.d/softmaker.repo
+        mode: '0644'
+
+    - name: Install SoftMaker Office
+      dnf:
+        name: softmaker-office-nx
+        state: present
+        update_cache: yes
+
+    # ============================================================================
+    # ANKI INSTALLATION
+    # ============================================================================
+
+    - name: Get latest Anki release info
+      uri:
+        url: https://api.github.com/repos/ankitects/anki/releases/latest
+        return_content: yes
+      register: anki_release
+
+    - name: Extract Anki download URL
+      set_fact:
+        anki_url: "{{ anki_release.json.assets | selectattr('name', 'match', '.*linux.*\\.tar\\.zst$') | map(attribute='browser_download_url') | first }}"
+
+    - name: Download Anki
+      get_url:
+        url: "{{ anki_url }}"
+        dest: "/tmp/{{ anki_url | basename }}"
+        mode: '0644'
+
+    - name: Extract Anki archive
+      unarchive:
+        src: "/tmp/{{ anki_url | basename }}"
+        dest: /tmp
+        remote_src: yes
+        creates: "/tmp/anki-*-linux-qt6"
+
+    - name: Find extracted Anki directory
+      find:
+        paths: /tmp
+        patterns: "anki-*-linux-qt6"
+        file_type: directory
+      register: anki_dir
+
+    - name: Check if Anki directory was found
+      debug:
+        msg: "Found {{ anki_dir.files | length }} Anki directories"
+
+    - name: Install Anki
+      shell: ./install.sh
+      args:
+        chdir: "{{ anki_dir.files[0].path }}"
+      register: anki_install
+      changed_when: anki_install.rc == 0
+      when: anki_dir.files | length > 0
+
+    - name: Display Anki installation warning if directory not found
+      debug:
+        msg: "Warning: Anki installation directory not found. Please install Anki manually."
+      when: anki_dir.files | length == 0
+
+    # ============================================================================
+    # BROWSER INSTALLATIONS
+    # ============================================================================
+
+    - name: Install DNF plugins core
+      dnf:
+        name: dnf-plugins-core
+        state: present
+
+    - name: Add Brave Browser repository
+      get_url:
+        url: https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo
+        dest: /etc/yum.repos.d/brave-browser.repo
+        mode: '0644'
+
+    - name: Install Brave Browser
+      dnf:
+        name: brave-browser
+        state: present
+
+    - name: Import Microsoft GPG key
+      rpm_key:
+        key: https://packages.microsoft.com/keys/microsoft.asc
+        state: present
+
+    - name: Add Visual Studio Code repository
+      yum_repository:
+        name: code
+        description: Visual Studio Code
+        baseurl: https://packages.microsoft.com/yumrepos/vscode
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: https://packages.microsoft.com/keys/microsoft.asc
+
+    - name: Install Visual Studio Code
+      dnf:
+        name: code
+        state: present
+        update_cache: yes
+
+    # ============================================================================
+    # MAIN SOFTWARE PACKAGES
+    # ============================================================================
+
+    - name: Install main software packages
+      dnf:
+        name:
+          - thunderbird
+          - keepassxc
+          - syncthing
+          - okular
+          - gimp
+          - latex
+          - texstudio
+          - texlive-scheme-full
+          - htop
+          - meld
+          - vlc
+          - ImageMagick
+          - chromium
+          - terminator
+          - tlp
+          - tlp-rdw
+          - inkscape
+          - wireguard-tools
+          - lm_sensors
+          - remmina
+          - gnome-tweaks
+          - fish
+          - lshw
+          - dmidecode
+          - gparted
+        state: present
+
+    # ============================================================================
+    # POWER MANAGEMENT CONFIGURATION
+    # ============================================================================
+
+    - name: Remove conflicting power management tools
+      dnf:
+        name:
+          - tuned
+          - tuned-ppd
+        state: absent
+
+    - name: Enable TLP service
+      systemd:
+        name: tlp.service
+        enabled: yes
+        state: started
+
+    - name: Mask conflicting rfkill services
+      systemd:
+        name: "{{ item }}"
+        masked: yes
+      loop:
+        - systemd-rfkill.service
+        - systemd-rfkill.socket
+
+    # ============================================================================
+    # FLATPAK APPLICATIONS
+    # ============================================================================
+
+    - name: Install Obsidian via Flatpak
+      flatpak:
+        name: md.obsidian.Obsidian
+        state: present
+        remote: flathub
+
+    - name: Install GNOME Extensions via Flatpak
+      flatpak:
+        name: org.gnome.Extensions
+        state: present
+        remote: flathub
+
+    # ============================================================================
+    # COPR REPOSITORIES AND SPECIALIZED TOOLS
+    # ============================================================================
+
+    - name: Enable pympress COPR repository
+      shell: dnf copr enable cimbali/pympress -y
+      register: pympress_copr
+      changed_when: "'already enabled' not in pympress_copr.stderr"
+
+    - name: Install pympress
+      dnf:
+        name: python3-pympress
+        state: present
+
+    - name: Enable fw-ectool COPR repository
+      shell: dnf copr enable rowanfr/fw-ectool -y
+      register: ectool_copr
+      changed_when: "'already enabled' not in ectool_copr.stderr"
+
+    - name: Install fw-ectool
+      dnf:
+        name: fw-ectool
+        state: present
+
+    # ============================================================================
+    # CUSTOM SERVICES SETUP
+    # ============================================================================
+
+    - name: Download battery charge limit service script
+      get_url:
+        url: https://raw.githubusercontent.com/wwolfi/fedora_config/refs/heads/main/ectool-battery-charge-limit-service-creation.sh
+        dest: /tmp/ectool-battery-charge-limit-service-creation.sh
+        mode: '0755'
+
+    - name: Execute battery charge limit service script
+      shell: /tmp/ectool-battery-charge-limit-service-creation.sh
+      register: battery_service
+      changed_when: battery_service.rc == 0
+
+    - name: Download LUKS GRUB update service script
+      get_url:
+        url: https://raw.githubusercontent.com/wwolfi/fedora_config/refs/heads/main/luks-grub-update-service-creation.sh
+        dest: /tmp/luks-grub-update-service-creation.sh
+        mode: '0755'
+
+    - name: Execute LUKS GRUB update service script
+      shell: /tmp/luks-grub-update-service-creation.sh
+      register: grub_service
+      changed_when: grub_service.rc == 0
+
+    # ============================================================================
+    # CLEANUP AND FINAL TASKS
+    # ============================================================================
+
+    - name: Clean up temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/eduvpn.asc
+        - "/tmp/{{ anki_url | basename }}"
+        - /tmp/ectool-battery-charge-limit-service-creation.sh
+        - /tmp/luks-grub-update-service-creation.sh
+
+    - name: Display completion message
+      debug:
+        msg: |
+          ============================================================================
+          Fedora system configuration completed successfully!
+          
+          Installed components:
+          - Snapper with BTRFS snapshots
+          - GRUB-BTRFS integration
+          - LUKS encryption key management
+          - Development tools and applications
+          - Power management (TLP)
+          - Custom services
+          
+          Please reboot the system to ensure all changes take effect.
+          ============================================================================
+
+  handlers:
+    - name: Update GRUB configuration
+      shell: grub2-mkconfig -o /boot/grub2/grub.cfg
+      listen: "update grub"
